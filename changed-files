@@ -1,0 +1,129 @@
+#!/usr/bin/env ruby
+
+require 'date'
+require 'json'
+require 'progress_bar'
+
+def process_file?(file)
+  file.end_with? '.java' and not (file.end_with? 'Interface.java' or file.end_with? 'Config.java')
+end
+
+def get_git_date()
+  DateTime.parse `git show -s --format="%ci"`
+end
+
+def mvn_version()
+  msg = `git log --format=%B -n 1`
+  pattern = %r{.*v(.*)$}
+  if (matches = msg.match(pattern))
+    matches[1]
+  else
+    raise
+  end
+
+end
+
+def git_changes(file)
+  `git log --oneline --since=#{get_git_date.prev_month(12)} -- #{file} | wc -l`.to_i
+end
+
+def get_java_package(file)
+  return unless file[-5..-1] == '.java'
+
+  begin
+    File.open(file, &:readline)[/package (.*);\n/, 1] if File.exists? file and not File.zero? file
+  rescue
+    puts "problem with #{file}"
+    raise
+  end
+end
+
+def get_sonar_measured_files
+  files = Hash.new
+
+  page_index = 1
+  page_size = 500
+
+  # "paging": {
+  #   "pageIndex": 2,
+  #   "pageSize": 500,
+  #   "total": 1515
+  # },
+
+  loop do
+    response = JSON.parse(`curl -s -u admin:admin "http://localhost:9000/api/measures/component_tree?component=[your-sonar-component]&qualifiers=FIL&metricKeys=complexity,ncloc,coverage&ps=#{page_size}&p=#{page_index}"`)
+    total = response['paging']['total']
+
+    response['components'].each do |file|
+      files[file['path']] = file['measures']
+    end
+
+    break unless page_index * page_size < total
+
+    page_index = page_index + 1
+  end
+
+  files
+end
+
+def select_measure(file, measures, measure_name)
+  # "src/main/java/homeguard/TextAudibleAlarm.java"=>
+  #     [{"metric"=>"ncloc", "value"=>"25"},
+  #      {"metric"=>"coverage", "value"=>"0.0", "bestValue"=>false},
+  #      {"metric"=>"complexity", "value"=>"3"}],
+
+  if measures.any? { |measure| measure['metric'] == measure_name }
+    measures.select { |measure| measure['metric'] == measure_name }.first['value'].to_i
+  else
+    # puts "missing #{measure_name} for #{file}"
+    0
+  end
+end
+
+# ===
+BASE_DIR = File.expand_path(File.dirname(__FILE__))
+
+if ARGV.length < 1
+  puts 'changed-files path-to-project-dir'
+  exit 1
+end
+
+project_dir = ARGV[0]
+Dir.chdir project_dir
+
+git_date = get_git_date
+
+data = {
+    :version => mvn_version,
+    :date => git_date.strftime('%d-%m-%Y'),
+    :churn => [],
+    :complexity => [],
+    :coverage => [],
+    :files => []
+}
+
+# ===
+
+sonar_files = get_sonar_measured_files.select { |file, _| process_file? file }
+
+puts "#{sonar_files.length} files to process"
+
+bar = ProgressBar.new(sonar_files.length)
+
+sonar_files.each do |file, measures|
+  data[:churn] << git_changes(file)
+  data[:complexity] << select_measure(file, measures, 'complexity')
+  data[:coverage] << select_measure(file, measures, 'coverage')
+  data[:files] << file
+
+  bar.increment!
+end
+
+# ===
+
+Dir.chdir BASE_DIR
+
+out_file = "data/#{git_date.strftime('%Y%m%d')}.json"
+
+puts "Writing #{out_file}..."
+File.write(out_file, JSON.generate(data))
